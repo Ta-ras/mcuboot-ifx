@@ -1283,6 +1283,23 @@ bs_upload(char *buf, int len)
         not_yet_erased = 0;
 #endif
 
+        /* Ensure that the boot status flags are erased to prevent stale flag reuse */
+#ifndef MCUBOOT_ERASE_PROGRESSIVELY
+        if (!device_requires_erase(fap)) {
+            rc = boot_scramble_region(fap, boot_swap_info_off(fap),
+                                      (flash_area_get_size(fap) - boot_swap_info_off(fap)), false);
+            if (rc) {
+                goto out_invalid_data;
+            }
+        }
+#else
+        rc = boot_scramble_region(fap, boot_swap_info_off(fap),
+                                  (flash_area_get_size(fap) - boot_swap_info_off(fap)), false);
+        if (rc) {
+            goto out_invalid_data;
+        }
+#endif
+
         img_size = img_size_tmp;
 
 #if defined(MCUBOOT_SWAP_USING_OFFSET) && defined(MCUBOOT_SERIAL_DIRECT_IMAGE_UPLOAD)
@@ -1423,11 +1440,13 @@ bs_upload(char *buf, int len)
         curr_off += img_chunk_len + rem_bytes;
         if (curr_off == img_size) {
 #if defined(MCUBOOT_ERASE_PROGRESSIVELY) && defined(BOOT_IMAGE_HAS_STATUS_FIELDS)
-            /* Assure that sector for image trailer was erased. */
-            /* Check whether it was erased during previous upload. */
+            /* Assure that sector for image trailer was erased. If the image
+             * reached that sector, it was erased before the chunk was written
+             * there: erasing it again would wipe the end of the image.
+             */
             off_t start = flash_sector_get_off(&status_sector);
 
-            if (erase_range(fap, start, start) < 0) {
+            if (start >= not_yet_erased && erase_range(fap, start, start) < 0) {
                 rc = MGMT_ERR_EUNKNOWN;
                 goto out;
             }
@@ -1458,19 +1477,17 @@ out:
     boot_serial_output();
 
 #ifdef MCUBOOT_ENC_IMAGES
-    if (rc == 0 && fap != NULL) {
-        /* Check if this upload was for the primary slot */
-#if !defined(MCUBOOT_SERIAL_DIRECT_IMAGE_UPLOAD)
-        if (img_num <= BOOT_IMAGE_NUMBER &&
-            flash_area_id_from_multi_image_slot(img_num, 0) == FLASH_AREA_IMAGE_PRIMARY(0)) {
-#else
-        if (flash_area_id_from_direct_image(img_num) == FLASH_AREA_IMAGE_PRIMARY(0)) {
+    /* Last chunk received: decrypt the image in place if it is encrypted.
+     * Without direct upload img_num always names a primary slot; with it, an
+     * upload into a secondary slot is decrypted by the swap instead.
+     */
+    if (rc == 0 && fap != NULL && curr_off == img_size
+#if defined(MCUBOOT_SERIAL_DIRECT_IMAGE_UPLOAD)
+        && !(img_num > 0 &&
+             (img_num % BOOT_NUM_SLOTS) == BOOT_DIRECT_UPLOAD_SECONDARY_SLOT_ID_REMAINDER)
 #endif
-            if (curr_off == img_size) {
-                /* Last sector received, now start a decryption on the image if it is encrypted */
-                rc = boot_handle_enc_fw(fap);
-            }
-        }
+       ) {
+        rc = boot_handle_enc_fw(fap);
     }
 #endif
 

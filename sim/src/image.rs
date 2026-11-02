@@ -554,6 +554,31 @@ impl ImagesBuilder {
         }
     }
 
+    /// Bootstrap from a secondary image that ends exactly on a sector boundary, over an
+    /// invalid primary image that extends into the following sector.
+    pub fn make_sector_aligned_bootstrap_image(self) -> Images {
+        let mut flash = self.flash;
+        let ram = self.ram.clone(); // TODO: Avoid this clone.
+        let images = self.slots.into_iter().enumerate().map(|(image_num, slots)| {
+            let dep = BoringDep::new(image_num, &NO_DEPS);
+            let primaries = install_image(&mut flash, &self.areadesc, &slots, 0,
+                ImageSize::Largest, &ram, &dep, ImageManipulation::BadSignature, Some(0));
+            let upgrades = install_image(&mut flash, &self.areadesc, &slots, 1,
+                ImageSize::SectorAligned, &ram, &dep, ImageManipulation::None, Some(0));
+            OneImage {
+                slots,
+                primaries,
+                upgrades,
+            }}).collect();
+        Images {
+            flash,
+            areadesc: self.areadesc,
+            images,
+            total_count: None,
+            ram: self.ram,
+        }
+    }
+
     /// If security_cnt is None then do not add a security counter TLV, otherwise add the specified value.
     pub fn make_image_with_security_counter(self, security_cnt: Option<u32>) -> Images {
         let mut flash = self.flash;
@@ -797,6 +822,26 @@ impl ImagesBuilder {
                 let mut flash = SimMultiFlash::new();
                 flash.insert(dev_id, dev);
                 (flash, Rc::new(areadesc), &[Caps::SwapUsingScratch, Caps::OverwriteUpgrade, Caps::SwapUsingMove, Caps::RamLoad, Caps::DirectXip])
+            }
+            DeviceName::RA6M3 => {
+                // Renesas Flash: 8 sectors of 8K, 30 sectors of 32K (1MB variant). 
+                let dev = SimFlash::new(vec![
+                                        //First 8 sectors of 8K (64K), these are usually used to store mcuboot
+                                        8 * 1024, 8 * 1024, 8 * 1024, 8 * 1024, 8 * 1024, 8 * 1024, 8 * 1024, 8 * 1024,
+                                        //Next 30 sectors of 32K (960K), these are usually used to store the images
+                                        32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024,
+                                        32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024,
+                                        32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024, 32*1024 ],
+                                        align as usize, erased_val);
+                let dev_id = 0;
+                let mut areadesc = AreaDesc::new();
+                areadesc.add_flash_sectors(dev_id, &dev);
+                areadesc.add_image(0x020000, 0x020000, FlashId::Image0, dev_id);
+                areadesc.add_image(0x040000, 0x020000, FlashId::Image1, dev_id);
+                areadesc.add_image(0x060000, 0x020000, FlashId::ImageScratch, dev_id);
+                let mut flash = SimMultiFlash::new();
+                flash.insert(dev_id, dev);
+                (flash, Rc::new(areadesc), &[Caps::SwapUsingMove, Caps::SwapUsingOffset])
             }
         }
     }
@@ -2059,6 +2104,9 @@ enum ImageSize {
     Largest,
     /// Make the image quite larger than it can be for the partition/device/
     Oversized,
+    /// Make the image, including header and TLVs, end on the sector boundary
+    /// before the end of the largest possible image.
+    SectorAligned,
 }
 
 /// The sector size the bootloader operates on for `dev`: the logical
@@ -2280,6 +2328,17 @@ fn install_image_with_key(
             let largest_img_sz = compute_largest_image_size(dev, areadesc, slots,
                                                             HDR_SIZE, tlv.as_ref());
             largest_img_sz + dev.align()
+        }
+        ImageSize::SectorAligned => {
+            let largest_img_sz = compute_largest_image_size(dev, areadesc, slots,
+                                                            HDR_SIZE, tlv.as_ref());
+            let tlv_len = tlv.estimate_size();
+            let sector_sz = boot_sector_size(dev);
+            let total = HDR_SIZE + largest_img_sz + tlv_len - 1;
+            // No sector aligned size fits when the sector is larger than the
+            // image; use the largest image size.
+            (total - total % sector_sz).checked_sub(HDR_SIZE + tlv_len)
+                .unwrap_or(largest_img_sz)
         }
     };
 
@@ -2713,7 +2772,7 @@ pub struct SlotInfo {
     pub dev_id: u8,
 }
 
-#[cfg(all(not(feature = "max-align-16"), not(feature = "max-align-32")))]
+#[cfg(all(not(feature = "max-align-16"), not(feature = "max-align-32"), not(feature = "max-align-64"), not(feature = "max-align-128")))]
 const MAGIC: &[u8] = &[0x77, 0xc2, 0x95, 0xf3,
                        0x60, 0xd2, 0xef, 0x7f,
                        0x35, 0x52, 0x50, 0x0f,
@@ -2727,6 +2786,18 @@ const MAGIC: &[u8] = &[0x10, 0x00, 0x2d, 0xe1,
 
 #[cfg(feature = "max-align-32")]
 const MAGIC: &[u8] = &[0x20, 0x00, 0x2d, 0xe1,
+                       0x5d, 0x29, 0x41, 0x0b,
+                       0x8d, 0x77, 0x67, 0x9c,
+                       0x11, 0x0f, 0x1f, 0x8a];
+
+#[cfg(feature = "max-align-64")]
+const MAGIC: &[u8] = &[0x40, 0x00, 0x2d, 0xe1,
+                       0x5d, 0x29, 0x41, 0x0b,
+                       0x8d, 0x77, 0x67, 0x9c,
+                       0x11, 0x0f, 0x1f, 0x8a];
+
+#[cfg(feature = "max-align-128")]
+const MAGIC: &[u8] = &[0x80, 0x00, 0x2d, 0xe1,
                        0x5d, 0x29, 0x41, 0x0b,
                        0x8d, 0x77, 0x67, 0x9c,
                        0x11, 0x0f, 0x1f, 0x8a];
@@ -2808,7 +2879,7 @@ pub fn show_sizes() {
     }
 }
 
-#[cfg(all(not(feature = "max-align-16"), not(feature = "max-align-32")))]
+#[cfg(all(not(feature = "max-align-16"), not(feature = "max-align-32"),not(feature = "max-align-64"), not(feature = "max-align-128")))]
 fn test_alignments() -> &'static [usize] {
     &[1, 2, 4, 8]
 }
@@ -2823,6 +2894,15 @@ fn test_alignments() -> &'static [usize] {
     &[32]
 }
 
+#[cfg(feature = "max-align-64")]
+fn test_alignments() -> &'static [usize] {
+    &[64]
+}
+
+#[cfg(feature = "max-align-128")]
+fn test_alignments() -> &'static [usize] {
+    &[128]
+}
 /// For testing, some of the tests are quite slow. This will query for an
 /// environment variable `MCUBOOT_SKIP_SLOW_TESTS`, which can be set to avoid
 /// running these tests.
